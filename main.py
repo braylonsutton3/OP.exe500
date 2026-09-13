@@ -7,6 +7,10 @@ import requests
 import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
+try:
+    import pandas_market_calendars as mcal
+except Exception:
+    mcal = None
 
 
 # ============================================================
@@ -125,6 +129,71 @@ def clean_root(symbol):
         if s.startswith(root):
             return root
     return s
+
+
+
+
+def classify_market(symbol, bundle_contract=None):
+    s=(symbol or "").upper().strip()
+    if bundle_contract is not None or clean_root(s) in FALLBACK_SPECS or s.endswith("=F"):
+        return "futures"
+    if s.endswith("-USD") or s.endswith("-USDT"):
+        return "crypto"
+    return "equity"
+
+
+def market_session_status(symbol, bundle_contract=None):
+    """Return (is_open, label, reason) using Topstep permitted futures hours,
+    NYSE calendar for equities, and 24/7 for crypto. Freshness is checked separately.
+    """
+    kind = classify_market(symbol, bundle_contract)
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    if kind == "crypto":
+        return True, "MARKET OPEN", "Crypto trades continuously; live-feed freshness is checked separately."
+
+    if kind == "futures":
+        # Topstep general permitted hours (Central Time): Sunday 17:00 open;
+        # Mon-Fri flatten by 15:10; Mon-Thu reopen 17:00; Friday closed until Sunday.
+        ct = now_utc.tz_convert("America/Chicago")
+        wd = ct.weekday()  # Mon=0 ... Sun=6
+        mins = ct.hour * 60 + ct.minute
+        close_m = 15 * 60 + 10
+        reopen_m = 17 * 60
+        if wd == 5:
+            return False, "MARKET CLOSED", "Topstep futures are closed Saturday."
+        if wd == 6:
+            if mins < reopen_m:
+                return False, "MARKET CLOSED", "Topstep futures reopen Sunday at 5:00 PM CT."
+            return True, "MARKET OPEN", "Topstep Sunday session is open."
+        if wd == 4:
+            if mins >= close_m:
+                return False, "MARKET CLOSED", "Topstep Friday trading ends at 3:10 PM CT and reopens Sunday at 5:00 PM CT."
+            return True, "MARKET OPEN", "Topstep weekday session is open."
+        if close_m <= mins < reopen_m:
+            return False, "MARKET CLOSED", "Topstep daily close window: trading resumes at 5:00 PM CT."
+        return True, "MARKET OPEN", "Topstep permitted futures session is open (product-specific pauses/holidays may still apply)."
+
+    # Equities/ETFs: use official exchange calendar when available.
+    et = now_utc.tz_convert("America/New_York")
+    if mcal is not None:
+        try:
+            nyse = mcal.get_calendar("NYSE")
+            d = et.date()
+            sched = nyse.schedule(start_date=d, end_date=d)
+            if sched.empty:
+                return False, "MARKET CLOSED", "NYSE calendar is closed today."
+            op = pd.Timestamp(sched.iloc[0]["market_open"]).tz_convert("UTC")
+            cl = pd.Timestamp(sched.iloc[0]["market_close"]).tz_convert("UTC")
+            if not (op <= now_utc < cl):
+                return False, "MARKET CLOSED", f"NYSE regular session is {op.tz_convert('America/New_York').strftime('%-I:%M %p')}–{cl.tz_convert('America/New_York').strftime('%-I:%M %p')} ET today."
+            return True, "MARKET OPEN", "NYSE regular session is open."
+        except Exception:
+            pass
+    # Safe fallback if exchange calendar package is unavailable.
+    if et.weekday() >= 5 or not ((et.hour > 9 or (et.hour == 9 and et.minute >= 30)) and et.hour < 16):
+        return False, "MARKET CLOSED", "U.S. equity regular session is not open."
+    return True, "MARKET OPEN", "U.S. equity regular session appears open; exchange-calendar check unavailable."
 
 
 def round_to_tick(price, tick_size):
@@ -1601,6 +1670,7 @@ tick_size = float(bundle["tick_size"])
 tick_value = float(bundle["tick_value"])
 mode = bundle["mode"]
 is_futures = bundle.get("contract") is not None or clean_root(symbol) in FALLBACK_SPECS
+market_open, market_label, market_reason = market_session_status(symbol, bundle.get("contract"))
 
 last_price = np.nan
 for tf in ["1m","5m","15m","30m","4h","1d","1w"]:
@@ -1617,15 +1687,35 @@ scalp = one_minute_scalp(
     min_displacement_ratio, wick_body_ratio, max_feed_age=max_feed_age,
 )
 
+# Never issue an actionable scalp signal when the relevant market/session is closed.
+if not market_open:
+    scalp["signal"] = "WAIT"
+    scalp["reason"] = f"{market_label} — {market_reason}"
+
 # top status strip
-m1,m2,m3,m4,m5 = st.columns(5)
+m1,m2,m3,m4,m5,m6 = st.columns(6)
 m1.metric("1m SIGNAL", scalp.get("signal","WAIT"))
 m2.metric("Current price", f"{last_price:,.2f}" if np.isfinite(last_price) else "—")
 m3.metric("Take profit", f"{scalp['target']:,.2f}" if scalp.get("target") is not None else "—")
-m4.metric("$300-risk stop", f"{scalp['stop']:,.2f}" if scalp.get("stop") is not None and np.isfinite(scalp.get("stop",np.nan)) else "—")
-m5.metric("Data", "TOPSTEP LIVE" if mode.startswith("TopstepX") else "YAHOO / FALLBACK")
+m4.metric("Max-risk stop", f"{scalp['stop']:,.2f}" if scalp.get("stop") is not None and np.isfinite(scalp.get("stop",np.nan)) else "—")
+m5.metric("Market", market_label)
+feed_age = feed_age_seconds(df1)
+if mode.startswith("TopstepX") and market_open and np.isfinite(feed_age) and feed_age <= max_feed_age:
+    data_label = "LIVE / FRESH"
+elif market_open and np.isfinite(feed_age) and feed_age <= max_feed_age:
+    data_label = "FRESH FALLBACK"
+elif not market_open:
+    data_label = "CLOSED"
+else:
+    data_label = "STALE / NO LIVE"
+m6.metric("Data status", data_label)
 
 sig = scalp.get("signal","WAIT")
+if not market_open:
+    st.warning(f"MARKET CLOSED — {market_reason} OP.exe will not issue LONG/SHORT while closed.")
+elif np.isfinite(feed_age) and feed_age > max_feed_age:
+    st.warning(f"LIVE DATA NOT FRESH — newest 1m bar is {feed_age:.0f}s old. OP.exe forces WAIT.")
+
 if sig == "LONG":
     st.success(f"LONG — {scalp['reason']} · Target nearest unfilled 1m FVG midpoint at {scalp['target']:,.2f}.")
 elif sig == "SHORT":
@@ -1634,9 +1724,9 @@ else:
     st.warning(f"WAIT — {scalp.get('reason','No valid confirmation')}")
 
 if mode.startswith("TopstepX"):
-    st.caption("TopstepX / ProjectX is supplying the futures bars. Confirmation uses completed 1-minute candles; the newest bar supplies current price.")
+    st.caption("TopstepX / ProjectX is the futures data source. OP.exe labels it LIVE only when the market is open and the newest 1-minute bar passes the freshness limit. Completed candles generate confirmation; the newest bar supplies current price.")
 else:
-    st.caption("Yahoo/fallback data may be delayed or proxy data. OP.exe forces WAIT when the newest 1-minute bar exceeds the feed-age limit.")
+    st.caption("Yahoo/fallback data can be delayed or proxy data. It is never labeled Topstep LIVE. OP.exe forces WAIT if the market is closed or the newest 1-minute bar is stale.")
 
 if bundle.get("error"):
     st.caption(bundle["error"])
@@ -1790,3 +1880,4 @@ with st.expander("Data setup / secrets", expanded=False):
 
 st.divider()
 st.caption("OP.exe is a rules-based analysis tool, not an order-entry bot. LONG/SHORT/WAIT and catalyst/confluence scores are not guarantees. Slippage can make realized loss exceed a planned stop amount.")
+
