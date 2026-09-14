@@ -1556,7 +1556,7 @@ def one_minute_scalp(df1, price, max_risk, quantity, tick_size, tick_value, is_f
                      proximity_value, proximity_units, min_volume_ratio, min_size_ratio,
                      micro_min_size_ratio, micro_entry_value, micro_entry_units,
                      max_micro_target_dollars, min_displacement_ratio, wick_body_ratio,
-                     max_feed_age=180):
+                     soft_feed_age=180, hard_feed_age=900):
     if df1 is None or len(df1) < 30:
         return {"signal":"WAIT", "reason":"Not enough 1-minute data", "target":None, "stop":None, "fvg":None}
 
@@ -1587,8 +1587,10 @@ def one_minute_scalp(df1, price, max_risk, quantity, tick_size, tick_value, is_f
         and projected_target_dollars <= float(max_micro_target_dollars)
     )
 
-    if age > max_feed_age:
-        signal, reason = "WAIT", f"Market data is stale ({age:.0f}s old)"
+    # A modest feed delay is informational, not a reason by itself to erase an
+    # otherwise valid setup. Only a seriously stale feed blocks LONG/SHORT.
+    if age > hard_feed_age:
+        signal, reason = "WAIT", f"Market data is too stale to use safely ({age:.0f}s old)"
     elif micro_override:
         signal = direction
         reason = f"MICRO FVG scalp: price is very close to midpoint; reduced-target entry allowed without full confirmation (${projected_target_dollars:,.0f} projected)"
@@ -1606,6 +1608,8 @@ def one_minute_scalp(df1, price, max_risk, quantity, tick_size, tick_value, is_f
         "micro_radius": micro_radius, "tier": tier, "micro_override": micro_override,
         "projected_target_dollars": projected_target_dollars,
         "confirmed": confirmed, "confirmation_note": confirmation_note, "age": age,
+        "delay_warning": bool(np.isfinite(age) and age > soft_feed_age),
+        "hard_stale": bool(np.isfinite(age) and age > hard_feed_age),
     }
 
 
@@ -1623,11 +1627,11 @@ def catalyst_adjusted_higher_tf(evidence, catalyst_score):
 
 
 # ============================================================
-# USER INTERFACE — 1m FIRST, EVERYTHING ELSE SUPPORTING
+# USER INTERFACE — MULTI-TIMEFRAME OP.EXE
 # ============================================================
 
-st.title("OP.exe · 1-Minute FVG Scalper")
-st.caption("Primary output = your live 1-minute FVG-midpoint scalp. Higher timeframes, structure and catalysts stay visible as supporting data.")
+st.title("OP.exe · Multi-Timeframe Market Analyzer")
+st.caption("Each timeframe gets its own LONG / SHORT / WAIT analysis. The 1-minute row uses your FVG-midpoint retracement strategy; 5m through 1W use confluence and market structure.")
 
 with st.form("op_form", clear_on_submit=False):
     c1, c2, c3, c4 = st.columns([2.1, 1.0, 1.1, 1.15])
@@ -1640,7 +1644,7 @@ if run_button:
     st.session_state["symbol"] = symbol.upper().strip()
 symbol = st.session_state.get("symbol", symbol.upper().strip() or "MNQ")
 
-with st.expander("1-minute strategy settings", expanded=False):
+with st.expander("Strategy and data-delay settings", expanded=False):
     s1,s2,s3,s4 = st.columns(4)
     proximity_value = s1.number_input("Normal confirmation distance", min_value=0.25, value=3.0, step=0.25)
     proximity_units = s2.selectbox("Normal distance units", ["ticks", "price points"], index=0)
@@ -1654,8 +1658,9 @@ with st.expander("1-minute strategy settings", expanded=False):
     s9,s10,s11,s12 = st.columns(4)
     min_displacement_ratio = s9.number_input("Min displacement × avg body", min_value=0.5, value=1.2, step=0.1)
     wick_body_ratio = s10.number_input("Hammer/star wick ÷ body", min_value=1.0, value=2.0, step=0.25)
-    max_feed_age = int(s11.number_input("Max 1m feed age (sec)", min_value=60, max_value=1800, value=180, step=30))
+    soft_feed_age = int(s11.number_input("Delay warning after (sec)", min_value=60, max_value=1800, value=180, step=30))
     auto_refresh = s12.toggle("Auto refresh", value=False)
+    hard_feed_age = int(st.number_input("Force WAIT only after severe delay (sec)", min_value=300, max_value=7200, value=900, step=60))
     prefer_topstep = st.toggle("Prefer TopstepX / ProjectX live bars when credentials are configured", value=True)
 
 if auto_refresh:
@@ -1684,7 +1689,8 @@ scalp = one_minute_scalp(
     df1, last_price, max_risk, quantity, tick_size, tick_value, is_futures,
     proximity_value, proximity_units, min_volume_ratio, min_size_ratio,
     micro_min_size_ratio, micro_entry_value, micro_entry_units, max_micro_target_dollars,
-    min_displacement_ratio, wick_body_ratio, max_feed_age=max_feed_age,
+    min_displacement_ratio, wick_body_ratio,
+    soft_feed_age=soft_feed_age, hard_feed_age=hard_feed_age,
 )
 
 # Never issue an actionable scalp signal when the relevant market/session is closed.
@@ -1694,16 +1700,18 @@ if not market_open:
 
 # top status strip
 m1,m2,m3,m4,m5,m6 = st.columns(6)
-m1.metric("1m SIGNAL", scalp.get("signal","WAIT"))
+m1.metric("1m STRATEGY", scalp.get("signal","WAIT"))
 m2.metric("Current price", f"{last_price:,.2f}" if np.isfinite(last_price) else "—")
 m3.metric("Take profit", f"{scalp['target']:,.2f}" if scalp.get("target") is not None else "—")
 m4.metric("Max-risk stop", f"{scalp['stop']:,.2f}" if scalp.get("stop") is not None and np.isfinite(scalp.get("stop",np.nan)) else "—")
 m5.metric("Market", market_label)
 feed_age = feed_age_seconds(df1)
-if mode.startswith("TopstepX") and market_open and np.isfinite(feed_age) and feed_age <= max_feed_age:
+if mode.startswith("TopstepX") and market_open and np.isfinite(feed_age) and feed_age <= soft_feed_age:
     data_label = "LIVE / FRESH"
-elif market_open and np.isfinite(feed_age) and feed_age <= max_feed_age:
+elif market_open and np.isfinite(feed_age) and feed_age <= soft_feed_age:
     data_label = "FRESH FALLBACK"
+elif market_open and np.isfinite(feed_age) and feed_age <= hard_feed_age:
+    data_label = "DELAYED / USABLE"
 elif not market_open:
     data_label = "CLOSED"
 else:
@@ -1713,8 +1721,10 @@ m6.metric("Data status", data_label)
 sig = scalp.get("signal","WAIT")
 if not market_open:
     st.warning(f"MARKET CLOSED — {market_reason} OP.exe will not issue LONG/SHORT while closed.")
-elif np.isfinite(feed_age) and feed_age > max_feed_age:
-    st.warning(f"LIVE DATA NOT FRESH — newest 1m bar is {feed_age:.0f}s old. OP.exe forces WAIT.")
+elif np.isfinite(feed_age) and feed_age > hard_feed_age:
+    st.warning(f"DATA TOO STALE — newest 1m bar is {feed_age:.0f}s old. OP.exe forces WAIT only because the severe-delay limit was exceeded.")
+elif np.isfinite(feed_age) and feed_age > soft_feed_age:
+    st.info(f"SLIGHT DATA DELAY — newest 1m bar is {feed_age:.0f}s old. OP.exe still evaluates the strategy and does not force WAIT for this delay alone.")
 
 if sig == "LONG":
     st.success(f"LONG — {scalp['reason']} · Target nearest unfilled 1m FVG midpoint at {scalp['target']:,.2f}.")
@@ -1724,9 +1734,9 @@ else:
     st.warning(f"WAIT — {scalp.get('reason','No valid confirmation')}")
 
 if mode.startswith("TopstepX"):
-    st.caption("TopstepX / ProjectX is the futures data source. OP.exe labels it LIVE only when the market is open and the newest 1-minute bar passes the freshness limit. Completed candles generate confirmation; the newest bar supplies current price.")
+    st.caption("TopstepX / ProjectX is the futures data source. Completed candles generate confirmation; a small delay creates a warning but does not automatically change a valid signal to WAIT.")
 else:
-    st.caption("Yahoo/fallback data can be delayed or proxy data. It is never labeled Topstep LIVE. OP.exe forces WAIT if the market is closed or the newest 1-minute bar is stale.")
+    st.caption("Yahoo/fallback data can be delayed or proxy data. It is never labeled Topstep LIVE. A small delay is allowed; only severe staleness or a closed market forces WAIT.")
 
 if bundle.get("error"):
     st.caption(bundle["error"])
@@ -1832,8 +1842,8 @@ for tf in ["5m","15m","30m","4h","1d","1w"]:
         "Top evidence":"; ".join(e.get("reasons",[])[:4]) or "Mixed / neutral",
     })
 
-st.subheader("Supporting timeframe data")
-st.caption("These do not override your 1-minute scalp signal. They preserve the older OP.exe market-structure and catalyst context.")
+st.subheader("Other timeframe signals")
+st.caption("5m, 15m, 30m, 4h, 1d and 1w are independent confluence signals using structure, trend, momentum, liquidity, FVG and catalyst evidence. They do not override the separate 1-minute entry strategy.")
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with st.expander("All active unfilled 1-minute FVGs", expanded=False):
@@ -1880,4 +1890,3 @@ with st.expander("Data setup / secrets", expanded=False):
 
 st.divider()
 st.caption("OP.exe is a rules-based analysis tool, not an order-entry bot. LONG/SHORT/WAIT and catalyst/confluence scores are not guarantees. Slippage can make realized loss exceed a planned stop amount.")
-
